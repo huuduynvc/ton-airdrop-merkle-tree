@@ -1,0 +1,153 @@
+#include "imports/stdlib.fc";
+#include "jetton/jetton-utils.fc";
+#include "constants.fc";
+
+global slice data::nft_collection_wallet;
+global int data::merkle_root;
+global cell data::helper_code;
+global slice data::admin_wallet;
+
+global int context::op;
+global slice context::sender;
+global int context::query_id;
+
+() load_data() impure inline {
+    slice ds = get_data().begin_parse();
+    data::nft_collection_wallet = ds~load_msg_addr();
+    data::merkle_root = ds~load_uint(256);
+    data::helper_code = ds~load_ref();
+    data::admin_wallet = ds~load_msg_addr();
+}
+
+() save_data() impure inline {
+    set_data(begin_cell()
+        .store_slice(data::nft_collection_wallet)
+        .store_uint(data::merkle_root, 256)
+        .store_ref(data::helper_code)
+        .store_slice(data::admin_wallet)
+    .end_cell());
+}
+
+(slice, int) begin_parse_exotic(cell c) asm "XCTOS";
+
+(cell) helper_stateinit(int proof_hash, int index) {
+    return begin_cell()
+        .store_uint(6, 5)
+        .store_ref(data::helper_code)
+        .store_ref(begin_cell()
+            .store_uint(0, 1)
+            .store_slice(my_address())
+            .store_uint(proof_hash, 256)
+            .store_uint(index, 256)
+        .end_cell())
+    .end_cell();
+}
+
+(slice) helper_address(cell stateinit) {
+    return begin_cell()
+        .store_uint(0x400, 11)
+        .store_uint(cell_hash(stateinit), 256)
+    .end_cell().begin_parse();
+}
+
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
+    if (in_msg_body.slice_bits() < 96) {
+        return ();
+    }
+
+    context::op = in_msg_body~load_uint(32);
+    context::query_id = in_msg_body~load_uint(64);
+    (_, context::sender) = in_msg_full.begin_parse().skip_bits(4).load_msg_addr();
+
+    load_data();
+
+    if (context::op == op::deploy) {
+        throw_unless(error::already_deployed, data::nft_collection_wallet.preload_uint(2) == 0);
+        data::nft_collection_wallet = in_msg_body~load_msg_addr();
+        data::admin_wallet = context::sender;
+        save_data();
+    }
+
+    elseif (context::op == op::process_claim) {
+        cell proof_cell = in_msg_body~load_ref();
+        int index = in_msg_body~load_uint(256);
+
+        (slice cs, int exotic?) = proof_cell.begin_parse_exotic();
+        throw_unless(42, exotic?);
+        throw_unless(43, cs~load_uint(8) == 3);
+        throw_unless(44, data::merkle_root == cs~load_uint(256));
+
+        cell dict = cs~load_ref();
+        (slice entry, int found?) = dict.udict_get?(256, index);
+        slice minter = entry~load_msg_addr();
+        int mint_amount = entry~load_uint(64);
+        throw_unless(45, found?);
+        throw_unless(46, msg_value >= mint_amount * 6000000);
+
+        throw_unless(error::wrong_sender, equal_slices(context::sender, helper_address(helper_stateinit(proof_cell.cell_hash(), index))));
+
+        builder msg = begin_cell()
+                  .store_uint(0x10, 6)
+                  .store_slice(data::nft_collection_wallet)
+                  .store_coins(mint_amount * 60000000)
+                  .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1)
+                  .store_uint(1, 1)
+                  .store_ref(
+            begin_cell()
+                      .store_uint(1, 32)
+                      .store_uint(context::query_id, 64)
+                      .store_uint(mint_amount, 64)
+                      .store_uint(0, 8)
+                      .store_slice(minter)
+                    .end_cell()
+        );
+        send_raw_message(msg.end_cell(), 1);
+    }
+
+    elseif (context::op == 1) { ;; change nft collection wallet
+        throw_unless(401, equal_slices(context::sender, data::admin_wallet));
+        data::nft_collection_wallet = in_msg_body~load_msg_addr();
+        save_data();
+    }
+
+    elseif (context::op == 2) { ;; change merkle root
+        throw_unless(401, equal_slices(context::sender, data::admin_wallet));
+        data::merkle_root = in_msg_body~load_uint(256);
+        save_data();
+    }
+
+    elseif (context::op == 3) { ;; change helper code
+        throw_unless(401, equal_slices(context::sender, data::admin_wallet));
+        data::helper_code = in_msg_body~load_ref();
+        save_data();
+    }
+
+    elseif (context::op == 4) { ;; change admin wallet
+        throw_unless(401, equal_slices(context::sender, data::admin_wallet));
+        data::admin_wallet = in_msg_body~load_msg_addr();
+        save_data();
+    }
+
+    elseif(context::op == 5) { ;; withdraw ton
+        throw_unless(401, equal_slices(context::sender, data::admin_wallet));
+        [int balance, _] = get_balance();
+        var withdraw_msg = begin_cell()
+        .store_uint(0x10, 6) ;; nobounce
+        .store_slice(context::sender)
+        .store_coins(0)
+        .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1);
+
+        send_raw_message(withdraw_msg.end_cell(), 128);
+
+        return ();
+    }
+
+    else {
+        throw(0xffff);
+    }
+}
+
+(slice, int, cell) get_contract_data() method_id {
+    load_data();
+    return (data::nft_collection_wallet, data::merkle_root, data::helper_code);
+}
